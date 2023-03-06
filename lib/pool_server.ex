@@ -24,8 +24,7 @@ defmodule Pooly.PoolServer do
 
   @impl true
   def handle_info(:start_worker_supervisor, state = %{name: name, ma: {m, a}, size: size}) do
-    worker_sup_name = :"#{name}WorkerSupervisor"
-    workers = prepopulate(size, worker_sup_name, {m, a})
+    workers = prepopulate(size, worker_sup_name(name), {m, a})
     {:noreply, %{state | workers: workers}}
   end
 
@@ -43,13 +42,13 @@ defmodule Pooly.PoolServer do
 
   def handle_info(
         {:EXIT, pid, _reason},
-        state = %{ma: ma, monitors: monitors, workers: workers, worker_sup: worker_sup}
+        state = %{name: name, ma: ma, monitors: monitors, workers: workers}
       ) do
     case :ets.lookup(monitors, pid) do
       [{pid, ref}] ->
         true = Process.demonitor(ref)
         true = :ets.delete(monitors, pid)
-        new_state = %{state | workers: [new_worker(worker_sup, ma) | workers]}
+        new_state = %{state | workers: [new_worker(worker_sup_name(name), ma) | workers]}
         {:noreply, new_state}
 
       [{}] ->
@@ -86,6 +85,10 @@ defmodule Pooly.PoolServer do
     {:reply,
      {:name, name, :pid, self(), :free, length(workers), :inuse, :ets.info(monitors, :size)},
      state}
+  end
+
+  defp worker_sup_name(name) do
+    :"#{name}WorkerSupervisor"
   end
 
   defp prepopulate(size, sup, ma) do
