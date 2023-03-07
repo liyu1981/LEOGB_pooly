@@ -6,17 +6,20 @@ defmodule Pooly do
       %{
         name: "pool1",
         ma: {SampleWorker, []},
-        size: 5
+        size: 2,
+        max_overflow: 3
       },
       %{
         name: "pool2",
         ma: {SampleWorker, []},
-        size: 4
+        size: 3,
+        max_overflow: 0
       },
       %{
         name: "pool3",
         ma: {SampleWorker, []},
-        size: 3
+        size: 4,
+        max_overflow: 0
       }
     ]
 
