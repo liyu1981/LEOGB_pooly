@@ -8,7 +8,8 @@ defmodule Pooly.PoolServer do
               monitors: nil,
               workers: nil,
               overflow: nil,
-              max_overflow: nil
+              max_overflow: nil,
+              waiting: nil
   end
 
   def start_link(%{name: name} = pool_config) do
@@ -19,6 +20,7 @@ defmodule Pooly.PoolServer do
   def init(%{name: name, ma: ma, size: size, max_overflow: max_overflow}) do
     Process.flag(:trap_exit, true)
     monitors = :ets.new(:monitors, [:private])
+    waiting = :queue.new()
 
     state = %State{
       name: name,
@@ -26,7 +28,8 @@ defmodule Pooly.PoolServer do
       ma: ma,
       size: size,
       overflow: 0,
-      max_overflow: max_overflow
+      max_overflow: max_overflow,
+      waiting: waiting
     }
 
     send(self(), :start_worker_supervisor)
@@ -41,40 +44,70 @@ defmodule Pooly.PoolServer do
 
   def handle_info(
         {:DOWN, ref, _, _, _},
-        state = %{monitors: monitors, workers: workers, overflow: overflow}
+        state = %{monitors: monitors, workers: workers, overflow: overflow, waiting: waiting}
       ) do
-    case :ets.match(monitors, {:"$1", ref}) do
-      [[pid]] when overflow > 0 ->
-        true = :ets.delete(monitors, pid)
-        new_state = %{state | overflow: overflow - 1}
-        {:noreply, new_state}
+    case :queue.any(fn {_, ref_waiting} -> ref_waiting == ref end, waiting) do
+      # if it is the process in waiting queue down
+      true ->
+        new_waiting = :queue.filter(fn {_, ref_waiting} -> ref_waiting != ref end, waiting)
+        {:noreply, %{state | waiting: new_waiting}}
 
-      [[pid]] ->
-        true = :ets.delete(monitors, pid)
-        new_state = %{state | workers: [pid | workers]}
-        {:noreply, new_state}
+      # otherwise must be some process checked out a worker
+      false ->
+        true = Process.demonitor(ref)
 
-      [[]] ->
-        {:noreply, state}
+        case :ets.match(monitors, {:"$1", ref}) do
+          [[pid]] ->
+            true = :ets.delete(monitors, pid)
+
+            case :queue.out(waiting) do
+              {{:value, {from_waiting, ref_waiting}}, left_waiting} ->
+                true = :ets.insert(pid, {pid, ref_waiting})
+                GenServer.reply(from_waiting, pid)
+                {:noreply, %{state | waiting: left_waiting}}
+
+              {:empty, _} when overflow > 0 ->
+                {:noreply, %{state | overflow: overflow - 1}}
+
+              {:empty, _} ->
+                {:noreply, %{state | workers: [pid | workers]}}
+            end
+
+          [[]] ->
+            {:noreply, state}
+        end
     end
   end
 
   def handle_info(
         {:EXIT, pid, _reason},
-        state = %{name: name, ma: ma, monitors: monitors, workers: workers, overflow: overflow}
+        state = %{
+          name: name,
+          ma: ma,
+          monitors: monitors,
+          workers: workers,
+          overflow: overflow,
+          waiting: waiting
+        }
       ) do
     case :ets.lookup(monitors, pid) do
-      [{pid, ref}] when overflow > 0 ->
-        true = Process.demonitor(ref)
-        true = :ets.delete(monitors, pid)
-        new_state = %{state | overflow: overflow - 1}
-        {:noreply, new_state}
-
       [{pid, ref}] ->
         true = Process.demonitor(ref)
         true = :ets.delete(monitors, pid)
-        new_state = %{state | workers: [new_worker(worker_sup_name(name), ma) | workers]}
-        {:noreply, new_state}
+
+        case :queue.out(waiting) do
+          {{:value, {from_waiting, ref_waiting}}, left_waiting} ->
+            new_worker = new_worker(worker_sup_name(name), ma)
+            true = :ets.insert(monitors, {pid, ref_waiting})
+            GenServer.reply(from_waiting, new_worker)
+            {:noreply, %{state | workers: [new_worker | workers], waiting: left_waiting}}
+
+          {:empty, _} when overflow > 0 ->
+            {:noreply, %{state | overflow: overflow - 1}}
+
+          {:empty, _} ->
+            {:noreply, state}
+        end
 
       [] ->
         {:noreply, state}
@@ -83,15 +116,16 @@ defmodule Pooly.PoolServer do
 
   @impl true
   def handle_call(
-        :checkout,
-        {from_pid, _},
+        {:checkout, block},
+        {from_pid, _} = from,
         %{
           name: name,
           ma: ma,
           workers: workers,
           monitors: monitors,
           overflow: overflow,
-          max_overflow: max_overflow
+          max_overflow: max_overflow,
+          waiting: waiting
         } = state
       ) do
     case workers do
@@ -101,10 +135,15 @@ defmodule Pooly.PoolServer do
         {:reply, worker, %{state | workers: rest}}
 
       [] when max_overflow > 0 and overflow < max_overflow ->
-        worker = new_worker(worker_sup_name(name), ma)
         ref = Process.monitor(from_pid)
+        worker = new_worker(worker_sup_name(name), ma)
         true = :ets.insert(monitors, {worker, ref})
         {:reply, worker, %{state | overflow: overflow + 1}}
+
+      [] when block == true ->
+        ref = Process.monitor(from_pid)
+        new_waiting = :queue.in({from, ref}, waiting)
+        {:noreply, %{state | waiting: new_waiting}, :infinity}
 
       [] ->
         {:reply, :full, state}
@@ -114,19 +153,27 @@ defmodule Pooly.PoolServer do
   def handle_call(
         {:checkin, worker},
         _from,
-        %{name: name, workers: workers, monitors: monitors, overflow: overflow} = state
+        %{name: name, workers: workers, monitors: monitors, overflow: overflow, waiting: waiting} =
+          state
       ) do
     case :ets.lookup(monitors, worker) do
-      [{pid, ref}] when overflow > 0 ->
-        true = Process.demonitor(ref)
-        true = :ets.delete(monitors, pid)
-        :ok = terminate_worker(worker_sup_name(name), worker)
-        {:reply, :ok, %{state | overflow: overflow - 1}}
-
       [{pid, ref}] ->
         true = Process.demonitor(ref)
         true = :ets.delete(monitors, pid)
-        {:reply, :ok, %{state | workers: [pid | workers]}}
+
+        case :queue.out(waiting) do
+          {{:value, {from_waiting, ref_waiting}}, left_waiting} ->
+            true = :ets.insert(monitors, {pid, ref_waiting})
+            GenServer.reply(from_waiting, pid)
+            {:reply, :ok, %{state | waiting: left_waiting}}
+
+          {:empty, _} when overflow > 0 ->
+            :ok = terminate_worker(worker_sup_name(name), worker)
+            {:reply, :ok, %{state | overflow: overflow - 1}}
+
+          {:empty, _} ->
+            {:reply, :ok, %{state | workers: [pid | workers]}}
+        end
 
       [] ->
         {:reply, :ok, state}
@@ -141,12 +188,13 @@ defmodule Pooly.PoolServer do
           workers: workers,
           monitors: monitors,
           overflow: overflow,
-          max_overflow: max_overflow
+          max_overflow: max_overflow,
+          waiting: waiting
         } = state
       ) do
     {:reply,
      {:name, name, :pid, self(), :free, length(workers), :inuse, :ets.info(monitors, :size),
-      :overflow, "#{overflow}/#{max_overflow}"}, state}
+      :overflow, "#{overflow}/#{max_overflow}", :waiting, :queue.len(waiting)}, state}
   end
 
   defp worker_sup_name(name) do
